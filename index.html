@@ -1335,9 +1335,26 @@ JSON shape:
   fetchVerdict(name);
 }
 
+/* A factsheet carries the fields no free API does — benchmark, both expense
+   ratios, AUM, manager. Fold them in wherever the web layer came up empty. */
+function mergeSheetFacts(){
+  const rec=getHold(STATE.code);
+  if(!rec||!rec.facts)return;
+  STATE.facts=STATE.facts||{};
+  let used=false;
+  for(const k in rec.facts){
+    if(k==='sheetRatios')continue;
+    if(STATE.facts[k]==null||STATE.facts[k]==='NOT DISCLOSED'){ STATE.facts[k]=rec.facts[k]; used=true }
+  }
+  if(rec.src&&rec.src.asOf&&(STATE.facts.asOf==null||STATE.facts.asOf==='NOT DISCLOSED')){ STATE.facts.asOf=rec.src.asOf; used=true }
+  if(used&&!/factsheet/.test(STATE.factSrc||'')) STATE.factSrc=(STATE.factSrc?STATE.factSrc+' + ':'')+'your factsheet';
+  if(STATE.facts._error&&STATE.facts.expenseDirect!=null) delete STATE.facts._error;
+}
+
 function fv(v,suffix){ return (v==null||v==="NOT DISCLOSED"||v==="")?ND():esc(String(v))+(suffix||'') }
 
 function renderFacts(){
+  mergeSheetFacts();
   const f=STATE.facts||{};
   const failed=f._error||(!f.expenseDirect&&!f.aumCr&&!f.manager&&!f.benchmark&&!(f.holdings||[]).length);
 
@@ -1597,7 +1614,16 @@ async function parseDisclosureFile(file){
   return { holdings:normaliseRows(best.rows), asOf:findAsOf(best.grid,file.name), matched:best.b.title||best.b.sheet };
 }
 
-/* ---------- factsheet PDF: best effort, and it says so ---------- */
+/* ---------- factsheet PDF ----------
+   A factsheet is a designed two-column page, not a table dump. Grouping text
+   by vertical position alone merges the prose in the left column into the
+   holdings table on the right, which is what made the first attempt fail.
+   So: find the table's own header, take its column positions, and read only
+   the text that sits under them.
+
+   A factsheet also lists only the larger positions, and says so — "Others
+   Equity Total". That is captured too, so the app can state how much of the
+   fund the named holdings actually cover instead of implying it is all of it. */
 function loadPDFJS(){
   if(window.pdfjsLib) return Promise.resolve();
   return new Promise((res,rej)=>{
@@ -1607,44 +1633,239 @@ function loadPDFJS(){
     sc.onerror=rej; document.head.appendChild(sc);
   });
 }
-/* A PDF has no rows, only characters at coordinates. Group them back into rows
-   by their vertical position, then left to right. */
-function pdfRows(items){
-  const by={};
-  items.forEach(i=>{ const k=Math.round(i.y/2.2); (by[k]=by[k]||[]).push(i) });
-  return Object.keys(by).sort((a,b)=>b-a).map(k=>by[k].sort((a,b)=>a.x-b.x).map(i=>i.s));
+
+/* Text items back into rows, optionally limited to a horizontal band. */
+function pdfLines(items,xMin,xMax,tol){
+  const rows=[];
+  items.filter(i=>(xMin==null||i.x>=xMin)&&(xMax==null||i.x<=xMax))
+    .sort((a,b)=>b.y-a.y||a.x-b.x)
+    .forEach(i=>{
+      const last=rows[rows.length-1];
+      if(last&&Math.abs(last.y-i.y)<=(tol==null?2.2:tol)) last.items.push(i);
+      else rows.push({y:i.y,items:[i]});
+    });
+  rows.forEach(r=>{ r.items.sort((a,b)=>a.x-b.x); r.text=r.items.map(i=>i.s).join(' ').replace(/\s{2,}/g,' ').trim() });
+  return rows;
 }
-function rowsToHoldings(rows){
-  const out=[];
-  rows.forEach(cells=>{
-    if(cells.length<2)return;
-    const w=parseFloat(cells[cells.length-1].replace(/[%,]/g,''));
-    if(isNaN(w)||w<=0||w>100)return;
-    const nm=cells.slice(0,-1).join(' ').replace(/\s{2,}/g,' ').trim();
-    if(nm.length<4||!/[a-z]{3}/i.test(nm))return;
-    if(/total|net asset|nav|return|ratio|since|inception|benchmark|expense|year|month|%$/i.test(nm))return;
-    out.push({n:nm.slice(0,70),w,ind:'',isin:'',cash:CASH_ROW.test(nm)?1:0});
+const PAGE_NOISE=/click here|know more|^page \d+$/i;
+/* Only the first line. The strapline underneath ("an open ended equity scheme
+   predominantly investing in...") repeats category words and would let a page
+   for one fund outscore the page that actually belongs to it. */
+function pdfTitle(items,height){
+  const top=pdfLines(items.filter(i=>i.y>height-60),null,null,3);
+  for(const r of top){
+    const t=r.items.filter(i=>!PAGE_NOISE.test(i.s)).map(i=>i.s).join(' ').trim();
+    if(t.length>3) return t;
+  }
+  return '';
+}
+function pdfTopText(items,height){
+  return pdfLines(items.filter(i=>i.y>height-70),null,null,3).slice(0,4).map(r=>r.text).join(' ');
+}
+/* Reward the scheme's own words, punish the extra ones — otherwise
+   "Large Cap Fund" matches the "Large & Mid Cap Fund" page just as well. */
+function titleScore(title,tokens){
+  const flat=norm(title);
+  const hits=tokens.filter(t=>flat.includes(t)).length;
+  // Near-enough is not enough: "Quant Small Cap Fund" must not settle for the
+  // "Bandhan Small Cap Fund" page just because two words out of three line up.
+  if(tokens.length<2||hits<2||hits/tokens.length<0.8) return 0;
+  const words=title.toLowerCase().split(/[^a-z0-9]+/).filter(w=>w.length>2&&!/^(fund|the|and|scheme|plan|direct|growth|open|ended|regular)$/.test(w));
+  const extra=words.filter(w=>!tokens.some(t=>t.includes(w)||w.includes(t))).length;
+  return hits*3-extra*1.5;
+}
+
+const H_NAME=/company\s*\/?\s*instrument|name of (the )?(instrument|security)|company name|security name|^instrument$|^name$/i;
+const H_PCT=/%\s*(of|to)\s*(nav|net asset)|^%\s*of\s*nav$|% to nav/i;
+const H_IND=/^industry|^industries|^rating|^sector|industry\s*\/\s*rating/i;
+/* Rows that give a section's total rather than a position. Counting them
+   would double the portfolio. */
+const T_SECTION=/^(certificate of deposit|commercial paper|corporate bond|treasury bill|government (securit|bond)|state (government|development)|sdl|zero coupon|floating rate|equity|debt|money market|mutual fund unit|reit|invit|derivativ|bonds?|debenture|pass through|securitis|units? of)/i;
+const T_OTHERS=/others?\s+(equity\s+)?total/i;
+const T_TOTAL=/\btotals?\s*$|^total\b/i;   // "Equity Total", "REPO Total", "Sub Total"…
+const T_SECTION2=/(mutual fund units?|equity (and|&) equity related|money market instruments?|listed\s*\/?\s*awaiting)/i;
+const T_CASH=/net cash|cash (and|&) cash equivalent|treps|tri.?party|net receivab|net current asset|clearing corp|reverse repo|^repo\b|repo clearing/i;
+
+/* Read a page's holdings tables using the header's own column positions.
+   Factsheets often print TWO tables side by side, so every "% of NAV" header
+   starts its own table, and each table is fenced to its own slice of the page.
+   That fencing is also what keeps the left-hand prose column out. */
+function pdfGroups(items){
+  const rows=pdfLines(items,null,null,2.2);
+  for(const r of rows){
+    const pcts=r.items.filter(i=>H_PCT.test(i.s));
+    if(!pcts.length)continue;
+    const names=r.items.filter(i=>H_NAME.test(i.s)).map(i=>i.x).sort((a,b)=>a-b);
+    const inds=r.items.filter(i=>H_IND.test(i.s)).map(i=>i.x).sort((a,b)=>a-b);
+    const xs=pcts.map(i=>i.x).sort((a,b)=>a-b);
+    const groups=xs.map((pctX,i)=>{
+      const lo=i?xs[i-1]:-1;
+      const nameX=names.filter(x=>x<pctX&&x>lo).pop();
+      const indX=inds.filter(x=>x<pctX&&(nameX==null||x>nameX)).pop();
+      return {pctX,nameX,indX};
+    }).filter(g=>g.nameX!=null);
+    if(!groups.length)continue;
+    groups.forEach((g,i)=>{
+      g.headerY=r.y;
+      g.left=g.nameX-6;
+      g.right=groups[i+1]?groups[i+1].nameX-6:1e5;
+      // numbers sit right of the industry column; split the two at the midpoint
+      g.pctCut=g.indX!=null?(g.indX+g.pctX)/2+6:g.pctX-45;
+    });
+    return groups;
+  }
+  return null;
+}
+function pdfTable(items){
+  const groups=pdfGroups(items);
+  if(!groups) return null;
+  const out={holdings:[],others:null,cash:null,total:null,shorts:0};
+  groups.forEach(g=>{
+    const body=pdfLines(items.filter(i=>i.y<g.headerY-2&&i.x>=g.left&&i.x<g.right),null,null,2.2);
+    // The table is not the only thing in this column — performance and SIP
+    // tables sit below it. A jump in vertical spacing marks where it ended.
+    const gaps=[]; for(let i=1;i<Math.min(body.length,11);i++) gaps.push(body[i-1].y-body[i].y);
+    gaps.sort((a,b)=>a-b);
+    const gapLimit=Math.max(26,(gaps[Math.floor(gaps.length/2)]||8)*3);
+    let prevY=null;
+    for(const r of body){
+      if(prevY!=null&&prevY-r.y>gapLimit)break;
+      prevY=r.y;
+      const name=[],ind=[]; let pct=null;
+      r.items.forEach(i=>{
+        if(i.x>=g.pctCut){ const v=parseFloat(i.s.replace(/[%,]/g,'')); if(!isNaN(v))pct=v; }
+        else if(g.indX!=null&&i.x>=g.indX-6) ind.push(i.s);
+        else name.push(i.s);
+      });
+      const n=name.join(' ').replace(/\s{2,}/g,' ').trim();
+      if(!n&&pct==null)continue;
+      if(T_OTHERS.test(n)){ out.others=(out.others||0)+(pct||0); continue }
+      if(/^grand total/i.test(n)){ out.total=pct; break }
+      // section subtotals first: "REPO Total" is a total, not a cash holding
+      if(T_TOTAL.test(n)||T_SECTION.test(n)||T_SECTION2.test(n))continue;
+      if(T_CASH.test(n)){ out.cash=(out.cash||0)+(pct||0); continue }
+      if(pct==null)continue;
+      if(pct<0){ out.shorts+=pct; continue }        // short derivative legs
+      if(pct<=0||pct>105)continue;   // a single-holding FOF can read 100.2%
+      if(n.length<2||!/[a-z]{2}/i.test(n))continue;
+      out.holdings.push({n:n.slice(0,70),w:pct,ind:ind.join(' ').trim(),isin:'',cash:0});
+    }
   });
-  const sum=out.reduce((a,b)=>a+b.w,0);
-  if(out.length<8||sum<25||sum>115)
-    throw new Error('the holdings table in that PDF could not be read reliably — the monthly portfolio spreadsheet reads far better');
+  // Last resort against a section heading that slipped through: if the weights
+  // add to more than a whole fund, the rows without an industry are the totals.
+  const sum=h=>h.reduce((a,b)=>a+b.w,0);
+  if(sum(out.holdings)>102){
+    const withInd=out.holdings.filter(h=>h.ind);
+    if(withInd.length>=out.holdings.length*0.6&&sum(withInd)<=102) out.holdings=withInd;
+  }
+  // one issuer can appear twice with different instruments; add them up
+  const merged=[];const idx={};
+  out.holdings.forEach(h=>{
+    const k=norm(h.n);
+    if(idx[k]!=null){ merged[idx[k]].w+=h.w; if(!merged[idx[k]].ind)merged[idx[k]].ind=h.ind }
+    else { idx[k]=merged.length; merged.push(h) }
+  });
+  out.holdings=merged;
+  out.nameX=groups[0].nameX;
   return out;
 }
-async function parseFactsheetPdf(file){
+
+/* The left-hand column of a scheme page carries exactly the facts no free
+   API publishes: benchmark, both expense ratios, AUM, manager, turnover. */
+function pdfFacts(items,nameX){
+  const lines=pdfLines(items,null,(nameX||208)-20,2.2).map(r=>r.text).filter(Boolean);
+  const one=re=>{ for(const L of lines){ const m=L.match(re); if(m) return (m[1]||'').trim() } return null };
+  const after=(anchor,re,within)=>{
+    const i=lines.findIndex(L=>anchor.test(L));
+    if(i<0)return null;
+    for(let j=i+1;j<Math.min(lines.length,i+(within||6));j++){ const m=lines[j].match(re); if(m) return m[1] }
+    return null;
+  };
+  const f={}, put=(k,v,lo,hi)=>{
+    if(v==null||v==='')return;
+    if(lo!=null){ const n=parseFloat(String(v).replace(/,/g,'')); if(isNaN(n)||n<lo||n>hi)return; f[k]=n }
+    else f[k]=String(v).replace(/\s{2,}/g,' ').trim();
+  };
+  put('expenseDirect',after(/expense ratio/i,/^direct[^0-9]{0,12}([\d.]+)\s*%/i),0.01,3);
+  put('expenseRegular',after(/expense ratio/i,/^regular[^0-9]{0,12}([\d.]+)\s*%/i),0.01,4);
+  put('aumCr',(one(/month\s*end\s*aum[^0-9]*([\d,]+\.?\d*)/i)||one(/monthly\s*avg\.?\s*aum[^0-9]*([\d,]+\.?\d*)/i)),1,4000000);
+  put('benchmark',one(/^(?:tier\s*\d\s*)?benchmark\s*[:\-]\s*(.+)$/i));
+  const mi=lines.findIndex(L=>/^fund manager[^:]*:/i.test(L));
+  if(mi>=0){
+    let m=lines[mi].replace(/^fund manager[^:]*:\s*/i,'');
+    for(let j=mi+1;j<Math.min(lines.length,mi+3);j++){
+      if(/^[A-Z][A-Za-z ()^*$@]{2,34}\s*:/.test(lines[j])||/^\s*$/.test(lines[j]))break;
+      m+=' '+lines[j];
+    }
+    put('manager',m.slice(0,160));
+  }
+  put('launch',one(/inception date[^:]*:\s*(.+)$/i));
+  put('category',one(/^category\s*[:\-]\s*(.+)$/i));
+  const r={};
+  const rput=(k,v,lo,hi)=>{ if(v==null)return; const n=parseFloat(v); if(!isNaN(n)&&n>=lo&&n<=hi) r[k]=n };
+  rput('beta',one(/^beta\D{0,10}([\d.]+)/i),0,3);
+  rput('stdDev',one(/standard deviation[^0-9]*([\d.]+)\s*%/i),0,80);
+  rput('sharpe',one(/^sharpe\*?\D{0,10}(-?[\d.]+)/i),-5,5);
+  rput('turnover',after(/portfolio turnover/i,/^(?:equity|aggregate)\^?\D{0,10}([\d.]+)/i,4),0,50);
+  rput('ytm',one(/yield to maturity[^0-9]*([\d.]+)\s*%/i),0,30);
+  rput('duration',one(/(?:modified|macaulay|average) duration[^0-9]*([\d.]+)/i),0,40);
+  if(Object.keys(r).length) f.sheetRatios=r;
+  return f;
+}
+
+const DATE_RE=/(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}\s+20\d\d)|([A-Za-z]{3,9}\s+\d{1,2},?\s+20\d\d)|(\d{1,2}[-\/][A-Za-z0-9]{2,9}[-\/]20\d\d)/;
+
+/* Pure so it can be tested against a real factsheet without a browser. */
+function factsheetExtract(pages,schemeName){
+  const tokens=tokenize(schemeName);
+  const scored=pages.map(pg=>({pg,title:pdfTitle(pg.items,pg.height),sc:0}));
+  scored.forEach(s=>{ s.sc=titleScore(s.title,tokens) });
+  const top=Math.max(...scored.map(s=>s.sc));
+  if(top<=0) throw new Error('no page in that PDF is headed with this scheme\'s name');
+  // A scheme's page can run onto the next one; every page under the same
+  // heading belongs to it.
+  const mine=scored.filter(s=>s.sc===top);
+  let holdings=[], others=null, cash=null, facts={}, asOf=null, pageNos=[], total=null;
+  mine.forEach(s=>{
+    const t=pdfTable(s.pg.items);
+    pageNos.push(s.pg.p);
+    const d=(pdfTopText(s.pg.items,s.pg.height).match(DATE_RE)||[])[0];
+    if(d&&!asOf) asOf=d;
+    if(!t)return;
+    holdings=holdings.concat(t.holdings);
+    if(t.total!=null) total=t.total;
+    if(t.others!=null) others=(others||0)+t.others;
+    if(t.cash!=null) cash=(cash||0)+t.cash;
+    facts=Object.assign(pdfFacts(s.pg.items,(t&&t.nameX)||208),facts);
+  });
+  // A fund of funds legitimately holds one line. Anything else needs enough
+  // rows to be a table rather than a stray pair of numbers.
+  if(!holdings.length||(holdings.length<5&&total==null&&cash==null&&others==null))
+    throw new Error('found the page for this scheme but could not read a holdings table on it');
+  const named=holdings.reduce((a,b)=>a+b.w,0);
+  // Weights can legitimately pass 100: a liquid fund running negative net
+  // receivables holds 111% in paper against -11% cash. Judge the netted figure.
+  const netted=named+(cash||0)+(others||0);
+  if(netted>108) throw new Error('the weights read off that page add to '+netted.toFixed(0)+'%, so nothing has been used');
+  if(cash>0) holdings.push({n:'Cash & equivalents',w:cash,ind:'',isin:'',cash:1});
+  return { holdings, facts, asOf, partial:others!=null||netted<80,
+           namedPct:named, othersPct:others, cashPct:cash,
+           matched:'page '+pageNos.join(', ') };
+}
+
+async function parseFactsheetPdf(file,onProgress){
   await loadPDFJS();
   const pdf=await pdfjsLib.getDocument({data:new Uint8Array(await file.arrayBuffer())}).promise;
-  const tokens=tokenize(STATE.meta.scheme_name);
-  let best=null;
-  for(let p=1;p<=Math.min(pdf.numPages,400);p++){
-    const tc=await (await pdf.getPage(p)).getTextContent();
-    const items=tc.items.map(i=>({s:(i.str||'').trim(),x:i.transform[4],y:i.transform[5]})).filter(i=>i.s);
-    const text=items.map(i=>i.s).join(' ');
-    const sc=scoreName(text.slice(0,2500),tokens).score;
-    if(sc>0&&(!best||sc>best.sc)) best={sc,items,text,p};
+  const n=Math.min(pdf.numPages,400), pages=[];
+  for(let p=1;p<=n;p++){
+    const page=await pdf.getPage(p);
+    const vp=page.getViewport({scale:1});
+    const tc=await page.getTextContent();
+    pages.push({p,height:vp.height,items:tc.items
+      .map(i=>({s:(i.str||'').trim(),x:i.transform[4],y:i.transform[5]})).filter(i=>i.s)});
+    if(onProgress&&p%15===0) onProgress(p,n);
   }
-  if(!best) throw new Error('this scheme was not named anywhere in that PDF');
-  return { holdings:rowsToHoldings(pdfRows(best.items)),
-           asOf:findAsOf([[best.text.slice(0,800)]],file.name), matched:'page '+best.p };
+  return factsheetExtract(pages,STATE.meta.scheme_name);
 }
 
 /* ---------- what the holdings actually tell you ---------- */
@@ -1672,7 +1893,7 @@ function analyseHoldings(all){
 function addHoldFlags(a){
   const fb=document.getElementById('flagBox'); if(!fb)return;
   const add=(l,t,d)=>fb.insertAdjacentHTML('beforeend',flagHTML(l,t,d));
-  if(a.top10>60) add('amber','Concentrated in a handful of names',
+  if(a.top10>60&&a.total>75) add('amber','Concentrated in a handful of names',
     `The ten largest positions are ${a.top10.toFixed(0)}% of the fund. That can be conviction or fragility — either way, a few decisions drive your outcome.`);
   if(a.holdings[0]&&a.holdings[0].w>10) add('amber','One position above 10%',
     `${a.holdings[0].n} alone is ${a.holdings[0].w.toFixed(1)}% of the fund.`);
@@ -1688,24 +1909,41 @@ function bars(list,max){
   return list.map(h=>`<div class="holding"><div class="hn">${esc(h.n)}</div><div class="hb"><i style="width:${Math.max(4,h.w/m*100)}%"></i></div><div class="hp">${h.w.toFixed(1)}%</div></div>`).join('');
 }
 function holdReport(rec){
-  const a=rec.a, s=rec.src, spread=a.effN!=null&&a.count>6&&a.effN<a.count*0.65;
+  const a=rec.a, s=rec.src, part=s.partial;
+  const spread=!part&&a.effN!=null&&a.count>6&&a.effN<a.count*0.65;
+  const R=rec.facts&&rec.facts.sheetRatios;
   return `
     <div class="eyebrow">The fund's actual portfolio</div>
     <div class="grid g4">
-      ${stat('Holdings',String(a.count),'','names held')}
+      ${stat(part?'Named positions':'Holdings',String(a.count),'',part?'listed on the factsheet':'names held')}
+      ${part
+        ? stat('They cover',(s.namedPct||a.total).toFixed(0)+'%','amb','of the fund')
+        : stat('Behaves like',a.effN!=null?a.effN.toFixed(0):'—','amb','equally-sized names')}
       ${stat('Top 10',a.top10.toFixed(0)+'%',a.top10>60?'warn':'','of the fund')}
-      ${stat('Behaves like',a.effN!=null?a.effN.toFixed(0):'—','amb','equally-sized names')}
-      ${stat('Cash',a.cashPct.toFixed(1)+'%',a.cashPct>15?'warn':'','and equivalents')}
+      ${(()=>{ const neg=s.cashPct!=null&&s.cashPct<0;
+        return stat('Cash',(neg?s.cashPct:a.cashPct).toFixed(1)+'%',neg?'warn':(a.cashPct>15?'warn':''),
+          neg?'net of money borrowed via repo':'and equivalents') })()}
     </div>
+    ${part?`<div class="card" style="margin-top:11px"><div class="prose">A factsheet lists only the larger positions${s.othersPct?`, and puts the rest at <b>${s.othersPct.toFixed(1)}%</b> under "others"`:''}. So this is the top of the portfolio, not all of it — the concentration figures above are sound, but the number of names is not the fund's full count. The monthly portfolio disclosure spreadsheet gives every line.</div></div>`:''}
     ${spread?`<div class="card" style="margin-top:11px"><div class="prose">It holds <b>${a.count}</b> names, but the money is spread unevenly enough that it behaves like a <b>${a.effN.toFixed(0)}</b>-stock portfolio. The long tail of small positions moves the needle far less than the count suggests.</div></div>`:''}
     <div class="eyebrow">Biggest positions</div>
     <div class="card">${bars(a.holdings.slice(0,12))}
-      <span class="src">READ FROM YOUR FILE · ${esc((s.file||'').slice(0,44).toUpperCase())}${s.asOf?' · AS AT '+esc(String(s.asOf).toUpperCase()):''}</span>
+      <span class="src">READ FROM YOUR FILE · ${esc((s.file||'').slice(0,40).toUpperCase())}${s.asOf?' · AS AT '+esc(String(s.asOf).toUpperCase()):''}</span>
     </div>
     ${a.sectors.length?`<div class="eyebrow">Sector mix</div><div class="card">${bars(a.sectors.slice(0,8))}
-      <span class="src">SUMMED FROM THE INDUSTRY COLUMN OF YOUR FILE</span></div>`:''}
+      <span class="src">SUMMED FROM THE INDUSTRY COLUMN OF YOUR FILE${part?' · NAMED POSITIONS ONLY':''}</span></div>`:''}
     ${a.ratings.length?`<div class="eyebrow">Credit quality</div><div class="card">${bars(a.ratings.slice(0,8))}
-      <span class="src">SUMMED FROM THE RATING COLUMN OF YOUR FILE</span></div>`:''}
+      <span class="src">SUMMED FROM THE RATING COLUMN OF YOUR FILE${part?' · NAMED POSITIONS ONLY':''}</span></div>`:''}
+    ${R?`<div class="eyebrow">What the factsheet claims</div>
+    <div class="card">
+      <div class="grid g4">
+        ${R.stdDev!=null?stat('Volatility',R.stdDev.toFixed(2)+'%','','their window'):''}
+        ${R.sharpe!=null?stat('Sharpe',R.sharpe.toFixed(2),'','their window'):''}
+        ${R.beta!=null?stat('Beta',R.beta.toFixed(2),'','vs its benchmark'):''}
+        ${R.turnover!=null?stat('Turnover',R.turnover.toFixed(2)+'×','','a year'):''}
+      </div>
+      <div class="prose" style="font-size:12.5px;margin-top:12px">The AMC computes these over a window of its own choosing. This app computes volatility of <b>${STATE.calc.vol!=null?STATE.calc.vol.toFixed(2)+'%':'—'}</b> and Sharpe of <b>${STATE.calc.sharpe!=null?STATE.calc.sharpe.toFixed(2):'—'}</b> over a stated three-year window from NAV. Where they differ, it is the window, not an error.</div>
+    </div>`:''}
     <div class="card" style="margin-top:11px">
       <div class="prose" style="font-size:12.5px">Matched to <b>${esc(String(s.matched||'the only scheme in the file'))}</b> in ${esc(s.file||'')}${s.kind?` (${esc(s.kind)})`:''}. Stored in this browser only — it is not sent anywhere.</div>
       <div style="display:flex;gap:9px;margin-top:12px">
@@ -1767,22 +2005,28 @@ function bindHoldUpload(){
 async function handleHoldFile(file){
   const say=(html,colour)=>{ const m=document.getElementById('hmsg');
     if(m) m.innerHTML=`<div class="prose" style="font-size:12.5px;margin-top:13px;color:${colour||'var(--muted)'}">${html}</div>` };
+  const spin=t=>say(`<span class="spin" style="display:inline-block;vertical-align:-3px;margin-right:9px"></span>${t}`);
   const ext=(file.name.split('.').pop()||'').toLowerCase();
-  say(`<span class="spin" style="display:inline-block;vertical-align:-3px;margin-right:9px"></span>Reading ${esc(file.name)}…`);
+  spin(`Reading ${esc(file.name)}…`);
   try{
-    const parsed=ext==='pdf'?await parseFactsheetPdf(file):await parseDisclosureFile(file);
-    const rows=parsed&&parsed.holdings||[];
-    if(rows.length<3) throw new Error('only '+rows.length+' usable rows came out of it');
+    const parsed=ext==='pdf'
+      ? await parseFactsheetPdf(file,(p,n)=>spin(`Reading ${esc(file.name)} — page ${p} of ${n}…`))
+      : await parseDisclosureFile(file);
+    const rows=(parsed&&parsed.holdings)||[];
+    if(!rows.length) throw new Error('no positions with a weight came out of it');
     const a=analyseHoldings(rows);
     if(!a.count) throw new Error('no positions with a weight were found');
-    saveHold(STATE.code,{a,src:{file:file.name,asOf:parsed.asOf,matched:parsed.matched,
+    saveHold(STATE.code,{a,facts:parsed.facts||null,src:{
+      file:file.name, asOf:parsed.asOf, matched:parsed.matched,
+      partial:!!parsed.partial, namedPct:parsed.namedPct, othersPct:parsed.othersPct,
       kind:ext==='pdf'?'factsheet PDF':'portfolio disclosure'},saved:Date.now()});
-    renderHoldBox();
+    if(parsed.facts&&Object.keys(parsed.facts).length) renderFacts();   // also redraws the holdings
+    else renderHoldBox();
     addHoldFlags(a);
   }catch(e){
     say(`<b style="color:var(--amber)">Couldn't use that file.</b> ${esc(e.message||'it could not be read')}.<br>
-      An AMC's workbook covers every scheme it runs, so check it is the right fund house and the right month.
-      ${ext==='pdf'?'PDFs are read best-effort; the .xlsx portfolio disclosure is far more reliable.':''}`,'var(--muted)');
+      An AMC's file covers every scheme it runs, so check it is the right fund house and the right month.
+      ${ext==='pdf'?'A factsheet is read page by page looking for the one headed with this scheme\'s name; the .xlsx portfolio disclosure is more reliable and gives every holding.':''}`,'var(--muted)');
   }
 }
 
